@@ -7,7 +7,7 @@
  * Model. For card c shown with k options whose distractors have mean closeness
  * cost D_s, after Δt minutes since it was last seen:
  *
- *     P(correct) = 1/k + (1 − 1/k) · σ(θ_c + β_type − γ·ln(k−1) − D_s − F(Δt/h_c))
+ *     P(correct) = 1/k + (1 − 1/k) · σ(θ_c + α + β_type − γ·ln(k−1) − D_s − F(Δt/h_c))
  *     F(r) = F_max · (1 − (1 + r)^(−1/2))
  *
  * F is forgetting: about 0.9 logits at one half-life, levelling off at F_max.
@@ -16,11 +16,15 @@
  * every long-overdue card look forgotten (predictions ran 15 points low).
  *
  * θ_c is how well you discriminate this card's answer, h_c its memory
- * half-life (minutes), β_type a per-question-type calibration shared by all
- * cards. After each answer θ_c and β_type take a gradient step on the log
- * likelihood (so they settle where predictions match what you actually do),
- * and h_c grows on a success (more for a harder, better-spaced success) and
- * shrinks on a miss.
+ * half-life (minutes), α how strong you are overall and β_type a
+ * per-question-type offset. Each answer's evidence is shared out between
+ * θ_c, α and β_type in proportion to how unsure each still is (a Laplace,
+ * Kalman-style step on the likelihood): at first nothing is known about you,
+ * so a run of right answers raises α quickly and every card gets harder
+ * within a dozen answers; as the estimates firm up the steps shrink, and a
+ * little process noise keeps α and β free to follow you as you learn. h_c
+ * grows on a success (more for a harder, better-spaced success) and shrinks
+ * on a miss.
  *
  * The three difficulty levers the quiz pulls:
  *   - number of options k (1 the first time a card is seen, then 2–6);
@@ -65,8 +69,14 @@
     hMin: 1.5,
     hMax: 60 * 24 * 365 * 2,
     tauGain: 2.5, tauMin: 0.3, tauMax: 1.6, // spacing multiplier around 1
-    betaRate: 0.12,         // step of the per-type calibration
+    // prior variances (logit²) and per-answer process noise of the estimates
+    alpha0: 1.5,            // α to start from: the quiz is for a reader who knows the field;
+                            // a few answers correct it either way
+    va0: 2.0, qa: 0.004,    // α: you, over all question types
+    vb0: 0.5, qb: 0.002,    // β: one question type relative to α
+    vt0: 1.0, vtMin: 0.25,  // θ: one card (kept above vtMin, since you go on learning it)
     gap: 4,                 // a card is not repeated within this many questions
+    passMargin: 0.06, passMax: 8,   // next(): pass over reviews this far above the aim (at most this many)
     kMax: 6,
     ewmaRate: 0.08,
     aimGain: 0.5, aimSpan: 0.08,          // proportional term
@@ -134,12 +144,15 @@
   }
 
   /* Title words that a right answer repeats ("common ground" in the statement
-   * picked for 'Common Ground'). A question that names the title could then be
-   * answered by matching words, so plan() makes sure at least one wrong answer
+   * picked for 'Common Ground', "essential indexical" for 'The Problem of the
+   * Essential Indexical'). Every question names the paper, so it could be
+   * answered by matching words; plan() makes sure at least one wrong answer
    * repeats one of them too. */
   const CUE_STOP = new Set(['that', 'this', 'with', 'from', 'what', 'when', 'which', 'some', 'about',
     'into', 'their', 'there', 'toward', 'towards', 'does', 'have']);
-  const cueWords = memo(s => new Set(norm(s).split(' ').filter(w => w.length > 3 && !CUE_STOP.has(w)).map(stem)));
+  // words compared by their first 7 letters, so "indexicality" repeats "indexical"
+  const cueWords = memo(s => new Set(norm(s).split(' ').filter(w => w.length > 3 && !CUE_STOP.has(w))
+    .map(w => stem(w).slice(0, 7))));
   function titleCue(title, text) {
     const t = cueWords(text);
     return [...cueWords(title)].filter(w => t.has(w));
@@ -442,6 +455,8 @@
       const x = findExample(p, card.ref);
       if (!x) return null;
       const right = norm(x.phenomenon);
+      // the question names the paper, whose title can share words with the answer
+      const cue = titleCue(p.title, x.phenomenon);
       // `avoid` lists names that would also be a right answer for this example
       const avoid = new Set((x.avoid || []).flatMap(labelKeys));
       const seen = new Set(labelKeys(x.phenomenon));
@@ -453,7 +468,7 @@
       for (const n of x.near || []) {
         if (!norm(n) || repeat(n)) continue;
         take(n);
-        tiers[2].push({ kind: 'phen', text: n });
+        tiers[2].push({ kind: 'phen', text: n, cue: cueCount(cue, n) });
       }
       // Names from other papers were not: never one from the same topic (it
       // may be another name for the same thing), nor one that contains the
@@ -468,10 +483,11 @@
       for (const [k, e] of index.phenPool) {
         if (!k || sameTopic.has(k) || nests(e.text) || repeat(e.text)) continue;
         take(e.text);
-        if (e.areas.has(area)) tiers[1].push({ kind: 'phen', text: e.text });
-        else tiers[0].push({ kind: 'phen', text: e.text });
+        const o = { kind: 'phen', text: e.text, cue: cueCount(cue, e.text) };
+        if (e.areas.has(area)) tiers[1].push(o);
+        else tiers[0].push(o);
       }
-      return { correct: { kind: 'phen', text: x.phenomenon }, tiers };
+      return { correct: { kind: 'phen', text: x.phenomenon }, tiers, cue: cue.length > 0 };
     }
     return null;
   }
@@ -506,13 +522,14 @@
   function freshProgress() {
     return {
       v: 1, q: 0, cards: {}, beta: { a: 0, t: 0, d: 0, x: 0 },
+      alpha: M.alpha0, va: M.va0, vb: { a: M.vb0, t: M.vb0, d: M.vb0, x: M.vb0 },
       ewma: null, ctl: 0, recent: [], hist: [], off: {},
     };
   }
 
   function defaultSettings() {
     return {
-      target: 0.8, maxOptions: 6, showYear: true, autoAdvance: false,
+      target: 0.8, maxOptions: 6, showYear: true, advance: true,
       types: { a: true, t: true, d: true, x: true },
       areas: Object.fromEntries(AREAS.map(a => [a, true])),
     };
@@ -525,7 +542,65 @@
       this.set = Object.assign(defaultSettings(), settings || {});
       this.rng = rng || Math.random;
       this.skip = new Set();
-      for (const t of TYPES) if (typeof this.prog.beta[t] !== 'number') this.prog.beta[t] = 0;
+      this.setProgress(this.prog);
+    }
+
+    /* Adopt saved progress, filling in what older saves lack. */
+    setProgress(prog) {
+      this.prog = prog;
+      if (!prog.beta) prog.beta = {};
+      for (const t of TYPES) if (typeof prog.beta[t] !== 'number') prog.beta[t] = 0;
+      if (typeof prog.alpha !== 'number') this.warmStart();
+      if (!prog.vb) prog.vb = {};
+      for (const t of TYPES) if (typeof prog.vb[t] !== 'number') prog.vb[t] = M.vb0;
+      if (typeof prog.va !== 'number') prog.va = M.va0;
+    }
+
+    /* A save from before α existed: estimate α from the answer history. Each
+     * entry keeps k and the chance predicted at the time, so the logit of
+     * the time can be recovered and the answers replayed. */
+    warmStart() {
+      const prog = this.prog;
+      prog.alpha = M.alpha0;
+      prog.va = M.va0;
+      for (const r of prog.hist || []) {
+        const k = r[2], p = r[4], y = r[5];
+        if (!(k >= 2) || typeof p !== 'number') continue;
+        const g = 1 / k;
+        const s = clamp((p - g) / (1 - g), 0.02, 0.98);
+        const m = Math.log(s / (1 - s)) + prog.alpha;
+        this.learn(null, null, k, m, y);
+      }
+      // the aim's correction was making up for the old model's error about
+      // you, which α now carries: start the correction afresh
+      prog.ewma = null;
+      prog.ctl = 0;
+    }
+
+    /* One answer's evidence, shared between the card (st.th), you (α) and
+     * the question type (β) in proportion to their variances; m is the logit
+     * the answer was predicted with. Returns the predicted chance. */
+    learn(st, type, k, m, y) {
+      const prog = this.prog;
+      const g = 1 / k, s = sigmoid(m), p = g + (1 - g) * s;
+      const dP = (1 - g) * s * (1 - s);
+      const G = y ? dP / Math.max(p, 1e-6) : -dP / Math.max(1 - p, 1e-6);   // d log L / d m
+      const I = dP * dP / Math.max(p * (1 - p), 1e-6);                        // its Fisher information
+      if (st && typeof st.v !== 'number') st.v = Math.max(M.vtMin, M.vt0 / (1 + 0.3 * (st.n || 0)));
+      const vt = st ? st.v : 0, va = prog.va, vb = type ? prog.vb[type] : 0;
+      const den = 1 + I * (vt + va + vb);
+      const step = v => clamp(v * G / den, -1.5, 1.5);
+      if (st) {
+        st.th = clamp(st.th + step(vt), -4, 9);
+        st.v = Math.max(M.vtMin, vt - vt * vt * I / den);
+      }
+      prog.alpha = clamp(prog.alpha + step(va), -4, 8);
+      prog.va = Math.min(M.va0, va - va * va * I / den + M.qa);
+      if (type) {
+        prog.beta[type] = clamp(prog.beta[type] + step(vb), -3, 3);
+        prog.vb[type] = Math.min(M.vb0, vb - vb * vb * I / den + M.qb);
+      }
+      return p;
     }
 
     setIndex(index) { this.index = index; }
@@ -562,7 +637,8 @@
       const st = this.prog.cards[card.id];
       const dt = Math.max(0, (now - st.last) / 60000);
       const forget = M.fMax * (1 - 1 / Math.sqrt(1 + dt / st.h));
-      return st.th + (this.prog.beta[card.type] || 0) - M.gamma * Math.log(k - 1) - dMean - forget;
+      return st.th + (this.prog.alpha || 0) + (this.prog.beta[card.type] || 0) -
+        M.gamma * Math.log(k - 1) - dMean - forget;
     }
 
     predict(card, k, dMean, now) {
@@ -571,11 +647,15 @@
       return g + (1 - g) * sigmoid(this.logit(card, k, dMean, now));
     }
 
-    /* Which card next. Due cards first, most overdue (Δt/h) first; then a new
-     * card (unless you are persistently short and a card is at least halfway
-     * to due); then the card nearest to coming due. Never one of the last few
-     * shown, and preferably not from the paper just shown. */
-    pickCard(now) {
+    /* Cards in the order to try them. Due cards come first, most overdue
+     * (Δt/h) first, the first of them a little randomised; a new card is
+     * tried right after the first due one, since next() passes over a review
+     * that is too easy to ask and a new card is the likeliest replacement.
+     * With nothing due: a new card (unless you are persistently short and a
+     * card is at least halfway to due), then the cards nearest to coming
+     * due. Never one of the last few shown, and preferably not from the
+     * paper just shown. */
+    queue(now) {
       const cards = this.index.cards.filter(c => this.active(c) && !this.skip.has(c.id));
       const recent = this.prog.recent.slice(-M.gap);
       const blocked = new Set(recent);
@@ -595,35 +675,41 @@
       }
       const notLast = arr => {
         const other = arr.filter(e => e.c.pid !== lastPid);
-        return other.length ? other : arr;
+        return other.length ? other.concat(arr.filter(e => e.c.pid === lastPid)) : arr;
       };
+      due.sort((a, b) => b.u - a.u);
+      early.sort((a, b) => b.u - a.u);
+      const out = [];
       if (due.length) {
-        due.sort((a, b) => b.u - a.u);
-        const top = notLast(due).slice(0, 3);
+        const ordered = notLast(due);
+        const top = ordered.slice(0, 3);
         const w = [0.6, 0.25, 0.15].slice(0, top.length);
-        let r = this.rng() * w.reduce((a, b) => a + b, 0);
-        for (let i = 0; i < top.length; i++) { if ((r -= w[i]) <= 0) return top[i].c; }
-        return top[0].c;
+        let r = this.rng() * w.reduce((a, b) => a + b, 0), first = top[0];
+        for (let i = 0; i < top.length; i++) { if ((r -= w[i]) <= 0) { first = top[i]; break; } }
+        out.push(first.c);
+        if (fresh) out.push(fresh);
+        for (const e of ordered) if (e !== first) out.push(e.c);
+      } else {
+        // a persistent shortfall: review what is nearly due before adding more
+        const short = (this.prog.ctl || 0) > M.ctlMax / 2;
+        const ready = notLast(early).filter(e => e.u >= tau / 2);
+        if (fresh && short && ready.length) out.push(ready[0].c);
+        if (fresh) out.push(fresh);
       }
-      // a persistent shortfall: review what is nearly due before adding more
-      if (fresh && (this.prog.ctl || 0) > M.ctlMax / 2 && early.length) {
-        early.sort((a, b) => b.u - a.u);
-        const e = notLast(early)[0];
-        if (e.u >= tau / 2) return e.c;
+      for (const e of notLast(early)) if (out[0] !== e.c) out.push(e.c);
+      if (!out.length) {
+        // every introduced card was shown in the last few questions
+        let best = null, bestQ = Infinity;
+        for (const c of cards) {
+          const st = this.prog.cards[c.id];
+          if (st && st.lastQ < bestQ) { best = c; bestQ = st.lastQ; }
+        }
+        if (best) out.push(best);
       }
-      if (fresh) return fresh;
-      if (early.length) {
-        early.sort((a, b) => b.u - a.u);
-        return notLast(early)[0].c;
-      }
-      // every introduced card was shown in the last few questions
-      let best = null, bestQ = Infinity;
-      for (const c of cards) {
-        const st = this.prog.cards[c.id];
-        if (st && st.lastQ < bestQ) { best = c; bestQ = st.lastQ; }
-      }
-      return best;
+      return out;
     }
+
+    pickCard(now) { return this.queue(now)[0] || null; }
 
     /* A question for `card`: options and presentation chosen so the predicted
      * accuracy is nearest the aim. `kCap` lets the layout ask for fewer
@@ -642,7 +728,7 @@
       // over the card for the rest of this visit rather than ask a 1-option review
       if (kMax < 2) { this.skip.add(card.id); return null; }
       const aim = this.aim();
-      let best = null;
+      let best = null, hardest = null;
       for (let k = 2; k <= kMax; k++) {
         for (let s = 0; s <= 2; s++) {
           const comp = composition(counts, k - 1, s);
@@ -651,9 +737,15 @@
           // nearest the aim; among near-ties, closer distractors, then fewer options
           const score = Math.abs(p - aim) - 0.004 * s + 0.002 * k;
           if (!best || score < best.score) best = { k, s, p, comp, score };
+          if (!hardest || p < hardest.p) hardest = { k, s, p, comp };
         }
       }
       if (!best) { this.skip.add(card.id); return null; }
+      // Even the hardest presentation too easy: ask that one. (Near certainty
+      // every presentation's chance is squeezed toward 1 — 0.999 with two
+      // options, 0.996 with six close ones — and the tie-breaks above would
+      // otherwise pick the fewest options.)
+      if (hardest.p > aim + 0.03) best = hardest;
       const picks = [];
       for (const [t, m] of best.comp.took) {
         const pool = shuffle(cand.tiers[t].slice(), this.rng);
@@ -666,28 +758,60 @@
         }
         picks.push(...pool.slice(0, m).map(o => Object.assign({ tier: t }, o)));
       }
+      let dMean = best.comp.mean, p = best.p, tier = best.comp.took.length ? best.comp.took[0][0] : best.s;
+      if (cand.cue && picks.length && !picks.some(o => o.cue)) {
+        // no tier used had one: bring one in from another, in place of the
+        // easiest pick, and predict from the options actually shown
+        const key = o => o.kind + ':' + (o.pid || '') + '/' + (o.tid || '') + ':' + (o.text || '');
+        const have = new Set(picks.map(key));
+        let alt = null;
+        for (let t = 2; t >= 0 && !alt; t--) {
+          const pool = shuffle(cand.tiers[t].filter(o => o.cue && !have.has(key(o))), this.rng);
+          if (pool.length) alt = Object.assign({ tier: t }, pool[0]);
+        }
+        if (alt) {
+          let at = 0;
+          picks.forEach((o, i) => { if (o.tier < picks[at].tier) at = i; });
+          picks[at] = alt;
+          dMean = picks.reduce((a, o) => a + M.delta[o.tier], 0) / picks.length;
+          p = this.predict(card, best.k, dMean, now);
+          tier = Math.max(...picks.map(o => o.tier));
+        }
+      }
       const options = shuffle([Object.assign({ correct: true }, cand.correct), ...picks], this.rng);
-      // the tier the distractors actually came from (an empty close tier
-      // falls back to same-area ones, and the label should say so), and
-      // whether even the hardest presentation was predicted above the aim
-      const tier = best.comp.took.length ? best.comp.took[0][0] : best.s;
-      const sat = best.p > aim + 0.03 ? 'hard' : null;
-      return { card, intro: false, k: best.k, tier, sat, dMean: best.comp.mean, p: best.p, options };
+      // `tier` is the tier the distractors actually came from (an empty close
+      // tier falls back to same-area ones, and the label should say so);
+      // `sat`, whether even the hardest presentation was predicted above the aim
+      const sat = p > aim + 0.03 ? 'hard' : null;
+      return { card, intro: false, k: best.k, tier, sat, dMean, p, options };
     }
 
+    /* The next question. A review predicted well above the aim even at its
+     * hardest — more options and closer distractors cannot bring it down,
+     * as for a card you saw minutes ago — is passed over for one that can be
+     * pitched at the aim, usually a new card; it comes back once some
+     * forgetting makes it a test again. If nothing else can be asked, the
+     * first one passed over is asked after all. */
     next(now, kCap) {
-      for (let tries = 0; tries < 50; tries++) {
-        const card = this.pickCard(now);
-        if (!card) return null;
+      const aim = this.aim();
+      let fallback = null, passed = 0;
+      for (const card of this.queue(now).slice(0, 60)) {
         const q = this.plan(card, now, kCap);
-        if (q) return q;
+        if (!q) continue;
+        if (!q.intro && q.p > aim + M.passMargin && passed < M.passMax) {
+          if (!fallback) fallback = q;
+          passed++;
+          continue;
+        }
+        return q;
       }
-      return null;
+      return fallback;
     }
 
     snapshot(card) {
       const st = this.prog.cards[card.id];
-      return JSON.stringify({ st: st || null, beta: this.prog.beta[card.type], ewma: this.prog.ewma, ctl: this.prog.ctl || 0,
+      return JSON.stringify({ st: st || null, beta: this.prog.beta[card.type], vb: this.prog.vb[card.type],
+        alpha: this.prog.alpha, va: this.prog.va, ewma: this.prog.ewma, ctl: this.prog.ctl || 0,
         q: this.prog.q, recent: this.prog.recent.slice(), hist: this.prog.hist.slice() });
     }
 
@@ -695,6 +819,8 @@
       const s = JSON.parse(snap);
       if (s.st) this.prog.cards[card.id] = s.st; else delete this.prog.cards[card.id];
       this.prog.beta[card.type] = s.beta;
+      if (typeof s.vb === 'number') this.prog.vb[card.type] = s.vb;
+      if (typeof s.alpha === 'number') { this.prog.alpha = s.alpha; this.prog.va = s.va; }
       this.prog.ewma = s.ewma;
       this.prog.ctl = s.ctl;
       this.prog.q = s.q;
@@ -719,17 +845,8 @@
       }
       const st = prog.cards[card.id];
       const k = question.k;
-      const g = 1 / k;
-      const m = this.logit(card, k, question.dMean, now);
-      const s = sigmoid(m);
-      const p = g + (1 - g) * s;
       const y = correct ? 1 : 0;
-      // d log L / d m for P = g + (1−g)σ(m)
-      const dP = (1 - g) * s * (1 - s);
-      const grad = y ? dP / Math.max(p, 1e-6) : -dP / Math.max(1 - p, 1e-6);
-      const K = Math.max(0.3, 0.9 / Math.sqrt(1 + 0.3 * st.n));
-      st.th = clamp(st.th + clamp(K * grad, -1.5, 1.5), -4, 9);
-      prog.beta[card.type] = clamp((prog.beta[card.type] || 0) + M.betaRate * grad, -3, 3);
+      const p = this.learn(st, card.type, k, this.logit(card, k, question.dMean, now), y);
       const dt = Math.max(0, (now - st.last) / 60000);
       if (y) {
         const hard = 0.5 + 0.5 * Math.min(1, (M.gamma * Math.log(k - 1) + (question.dMean || 0)) / DMAX);
