@@ -29,7 +29,8 @@
  *   - spacing: a card comes due once the time since you last saw it reaches
  *     τ·h_c. τ is 1 at target and moves with your results (down to 0.3 when
  *     you are below target, so reviews come sooner; up to 1.6 above it).
- * Each turn takes the most overdue due card (else a new card, else the card
+ * Each turn takes the most overdue due card (else a new card — or, while you
+ * are persistently below target, a nearly due one first — else the card
  * nearest to due) and the (k, closeness) whose predicted accuracy is nearest
  * the aim. The aim is the target (80% by default) nudged by a running average
  * of recent results (proportional) and by their accumulated shortfall or
@@ -111,7 +112,19 @@
     return s[0] + ' et al.';
   }
 
-  function words(s) { return new Set(norm(s).split(' ').filter(w => w.length > 2)); }
+  /* Word sets are asked for again and again (every definition against every
+   * other, on every question), so they are kept by string. The strings are
+   * the content's own, so the caches stay as small as the content. */
+  function memo(fn) {
+    const cache = new Map();
+    return s => {
+      s = String(s || '');
+      let v = cache.get(s);
+      if (v === undefined) cache.set(s, v = fn(s));
+      return v;
+    };
+  }
+  const words = memo(s => new Set(norm(s).split(' ').filter(w => w.length > 2)));
   function jaccard(a, b) {
     const A = words(a), B = words(b);
     if (!A.size || !B.size) return 0;
@@ -120,15 +133,52 @@
     return n / (A.size + B.size - n);
   }
 
+  /* Title words that a right answer repeats ("common ground" in the statement
+   * picked for 'Common Ground'). A question that names the title could then be
+   * answered by matching words, so plan() makes sure at least one wrong answer
+   * repeats one of them too. */
+  const CUE_STOP = new Set(['that', 'this', 'with', 'from', 'what', 'when', 'which', 'some', 'about',
+    'into', 'their', 'there', 'toward', 'towards', 'does', 'have']);
+  const cueWords = memo(s => new Set(norm(s).split(' ').filter(w => w.length > 3 && !CUE_STOP.has(w)).map(stem)));
+  function titleCue(title, text) {
+    const t = cueWords(text);
+    return [...cueWords(title)].filter(w => t.has(w));
+  }
+  function cueCount(cue, text) {
+    if (!cue.length) return 0;
+    const t = cueWords(text);
+    return cue.filter(w => t.has(w)).length;
+  }
+
   const escRe = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
   /* Keys for spotting one label twice: its words in any order, and the same
    * without a parenthetical gloss — "homonymy (lexical ambiguity)" is
    * "lexical ambiguity (homonymy)", and "cross-sentential anaphora" is
    * "cross-sentential (discourse) anaphora". */
-  function labelKeys(s) {
-    const words = t => norm(t).split(' ').filter(Boolean).sort().join(' ');
-    return [words(s), words(String(s || '').replace(/\([^)]*\)/g, ' '))].filter(Boolean);
+  const labelKeys = memo(s => {
+    const words = t => labelTokens(t).slice().sort().join(' ');
+    return [words(s), words(s.replace(/\([^)]*\)/g, ' '))].filter(Boolean);
+  });
+  /* A label's words with articles dropped and plurals reduced, so "the
+   * essential indexical" is "essential indexical" and "paradoxes of material
+   * implication" is "paradox of material implication". Deliberately crude:
+   * it only has to make two spellings of one label agree. */
+  const ARTICLES = new Set(['the', 'a', 'an']);
+  function stem(w) {
+    if (w.length <= 3) return w;
+    if (/(x|z|ch|sh|ss)es$/.test(w)) return w.slice(0, -2);
+    if (/[^siu]s$/.test(w)) return w.slice(0, -1);
+    return w;
+  }
+  const labelTokens = memo(t => norm(t).split(' ').filter(w => w && !ARTICLES.has(w)).map(stem));
+
+  /* Key-order-independent serialization, for "is this the same content?" */
+  function stable(o) {
+    if (Array.isArray(o)) return '[' + o.map(stable).join(',') + ']';
+    if (o && typeof o === 'object') return '{' + Object.keys(o).filter(k => !k.startsWith('_')).sort()
+      .map(k => JSON.stringify(k) + ':' + stable(o[k])).join(',') + '}';
+    return JSON.stringify(o === undefined ? null : o);
   }
 
   /* Split `text` into [{t: string, blank: bool}] with every needle (and its
@@ -138,15 +188,18 @@
       .sort((a, b) => b.length - a.length);
     text = String(text || '');
     if (!list.length) return [{ t: text, blank: false }];
-    const re = new RegExp('(?<![\\p{L}\\p{N}])(?:' + list.map(escRe).join('|') +
+    // The word boundary before a needle is matched (group 1) rather than
+    // looked behind for: WebKit before 16.4 rejects lookbehind outright.
+    const re = new RegExp('(^|[^\\p{L}\\p{N}])(?:' + list.map(escRe).join('|') +
       ')(?:s|es)?(?![\\p{L}\\p{N}])', 'giu');
     const out = [];
     let last = 0, m;
     while ((m = re.exec(text))) {
-      if (m.index > last) out.push({ t: text.slice(last, m.index), blank: false });
-      out.push({ t: m[0], blank: true });
-      last = m.index + m[0].length;
-      if (m[0].length === 0) re.lastIndex++;
+      const start = m.index + m[1].length, end = m.index + m[0].length;
+      if (start > last) out.push({ t: text.slice(last, start), blank: false });
+      out.push({ t: text.slice(start, end), blank: true });
+      last = end;
+      if (end === m.index) re.lastIndex++;
     }
     if (last < text.length) out.push({ t: text.slice(last), blank: false });
     return out;
@@ -154,17 +207,69 @@
 
   // ------------------------------------------------------------- content index
 
-  /* Merge shipped papers with the user's edits: an edited or added paper
-   * replaces the shipped one wholesale; a removed id drops it. */
+  /* Merge shipped papers with the user's edits. An edit is stored as the
+   * user's copy of the paper (edits.papers[id]) beside the shipped paper it
+   * was made from (edits.base[id]), and merged three ways with the paper as
+   * shipped now: whatever the user changed is kept, whatever they left alone
+   * follows later shipped fixes — a corrected quotation, a new term, a new
+   * `avoid` entry. Fields are merged one by one, terms and examples item by
+   * item (by id); a pick moves with its statement when the candidates change.
+   * An edit saved before bases were kept replaces the paper wholesale, as it
+   * always did. A removed id drops the paper. */
+  function merge3(old, mine, cur) {
+    const same = (a, b) => stable(a) === stable(b);
+    const out = {};
+    const keys = new Set([...Object.keys(old), ...Object.keys(mine), ...Object.keys(cur)]);
+    for (const k of keys) {
+      if (k.startsWith('_') || ['theses', 'pick', 'terms', 'examples'].includes(k)) continue;
+      const v = same(mine[k], old[k]) ? cur[k] : mine[k];
+      if (v !== undefined) out[k] = v;
+    }
+    if (same(mine.theses, old.theses)) {
+      out.theses = cur.theses || [];
+      if (mine.pick === old.pick) out.pick = cur.pick;
+      else {
+        const chosen = ((old.theses || [])[mine.pick] || {}).text;
+        const at = out.theses.findIndex(t => t.text === chosen);
+        out.pick = at >= 0 ? at : clamp(mine.pick | 0, 0, Math.max(0, out.theses.length - 1));
+      }
+    } else {
+      out.theses = mine.theses || [];
+      out.pick = mine.pick;
+    }
+    for (const list of ['terms', 'examples']) {
+      const byId = arr => new Map((arr || []).filter(x => x && x.id).map(x => [x.id, x]));
+      const o = byId(old[list]), m = byId(mine[list]), c = byId(cur[list]);
+      const merged = [];
+      for (const [id, ci] of c) {
+        if (o.has(id) && !m.has(id)) continue;                    // the user deleted it
+        if (m.has(id) && !(o.has(id) && same(m.get(id), o.get(id)))) merged.push(m.get(id));  // the user changed it
+        else merged.push(ci);                                      // untouched, or new in the shipped data
+      }
+      for (const [id, mi] of m) {
+        if (c.has(id)) continue;
+        if (o.has(id) && same(mi, o.get(id))) continue;           // the shipped data dropped it, untouched
+        merged.push(mi);                                           // the user's own, or changed and kept
+      }
+      out[list] = merged;
+    }
+    return out;
+  }
+
   function mergePapers(base, edits) {
     const e = edits || {};
     const over = e.papers || {};
+    const bases = e.base || {};
     const removed = new Set(e.removed || []);
     const out = [];
     const seen = new Set();
     for (const p of base) {
       if (removed.has(p.id)) continue;
-      out.push(over[p.id] ? Object.assign({}, over[p.id], { _edited: true }) : p);
+      const mine = over[p.id];
+      if (!mine) out.push(p);
+      else if (!bases[p.id]) out.push(Object.assign({}, mine, { _edited: true }));
+      else out.push(Object.assign(merge3(bases[p.id], mine, p), { _edited: true,
+        _baseChanged: stable(bases[p.id]) !== stable(p) }));
       seen.add(p.id);
     }
     for (const id of Object.keys(over)) {
@@ -289,17 +394,18 @@
       const first = norm(surname((p.authors || [])[0]));
       // `avoid` names papers whose statements could pass for this one's
       const avoid = new Set(p.avoid || []);
+      const cue = titleCue(p.title, text);
       for (const q of index.papers) {
         if (q.id === p.id || avoid.has(q.id) || (q.avoid || []).includes(p.id)) continue;
         const qt = thesisText(q);
         if (!qt || jaccard(qt, text) > 0.6) continue;
-        const o = { kind: 'thesis', pid: q.id };
+        const o = { kind: 'thesis', pid: q.id, cue: cueCount(cue, qt) };
         const sameAuthor = first && norm(surname((q.authors || [])[0])) === first;
         if (q.topic === topic || sameAuthor) tiers[2].push(o);
         else if (q.area === area) tiers[1].push(o);
         else tiers[0].push(o);
       }
-      return { correct: { kind: 'thesis', pid: p.id }, tiers };
+      return { correct: { kind: 'thesis', pid: p.id }, tiers, cue: cue.length > 0 };
     }
 
     if (card.type === 'd') {
@@ -310,19 +416,26 @@
       // could pass for this paper's; either side's list rules the pair out
       const me = p.id + '/' + t.id;
       const avoid = new Set(t.avoid || []);
+      // the words a definition shows: its own, less its term's (which are
+      // blanked) — set arithmetic, since masking all of them is too slow here
+      const shown = u => {
+        const hide = cueWords([u.term].concat(u.aliases || []).join(' '));
+        return [...cueWords(u.definition)].filter(w => !hide.has(w));
+      };
+      const cue = (() => { const tw = cueWords(p.title); return shown(t).filter(w => tw.has(w)); })();
       for (const q of index.papers) {
         for (const u of q.terms || []) {
           if (!u || !u.definition || !u.term) continue;
           if (q.id === p.id && u.id === t.id) continue;
           if (avoid.has(q.id + '/' + u.id) || (u.avoid || []).includes(me)) continue;
           if (jaccard(u.definition, t.definition) > 0.6) continue;
-          const o = { kind: 'def', pid: q.id, tid: u.id };
+          const o = { kind: 'def', pid: q.id, tid: u.id, cue: cue.length ? shown(u).filter(w => cue.includes(w)).length : 0 };
           if (q.id === p.id || norm(u.term) === tn || q.topic === topic) tiers[2].push(o);
           else if (q.area === area) tiers[1].push(o);
           else tiers[0].push(o);
         }
       }
-      return { correct: { kind: 'def', pid: p.id, tid: t.id }, tiers };
+      return { correct: { kind: 'def', pid: p.id, tid: t.id }, tiers, cue: cue.length > 0 };
     }
 
     if (card.type === 'x') {
@@ -347,9 +460,13 @@
       // answer or is contained in it ("implicature" for "scalar implicature").
       const sameTopic = new Set();
       for (const [k, e] of index.phenPool) if (e.topics.has(topic)) sameTopic.add(k);
-      const nests = k => (' ' + k + ' ').includes(' ' + right + ' ') || (' ' + right + ' ').includes(' ' + k + ' ');
+      const rightT = ' ' + labelTokens(x.phenomenon).join(' ') + ' ';
+      const nests = name => {
+        const t = ' ' + labelTokens(name).join(' ') + ' ';
+        return t.trim() && (t.includes(rightT) || rightT.includes(t));
+      };
       for (const [k, e] of index.phenPool) {
-        if (!k || sameTopic.has(k) || nests(k) || repeat(e.text)) continue;
+        if (!k || sameTopic.has(k) || nests(e.text) || repeat(e.text)) continue;
         take(e.text);
         if (e.areas.has(area)) tiers[1].push({ kind: 'phen', text: e.text });
         else tiers[0].push({ kind: 'phen', text: e.text });
@@ -455,7 +572,8 @@
     }
 
     /* Which card next. Due cards first, most overdue (Δt/h) first; then a new
-     * card; then the card nearest to coming due. Never one of the last few
+     * card (unless you are persistently short and a card is at least halfway
+     * to due); then the card nearest to coming due. Never one of the last few
      * shown, and preferably not from the paper just shown. */
     pickCard(now) {
       const cards = this.index.cards.filter(c => this.active(c) && !this.skip.has(c.id));
@@ -486,6 +604,12 @@
         let r = this.rng() * w.reduce((a, b) => a + b, 0);
         for (let i = 0; i < top.length; i++) { if ((r -= w[i]) <= 0) return top[i].c; }
         return top[0].c;
+      }
+      // a persistent shortfall: review what is nearly due before adding more
+      if (fresh && (this.prog.ctl || 0) > M.ctlMax / 2 && early.length) {
+        early.sort((a, b) => b.u - a.u);
+        const e = notLast(early)[0];
+        if (e.u >= tau / 2) return e.c;
       }
       if (fresh) return fresh;
       if (early.length) {
@@ -533,10 +657,22 @@
       const picks = [];
       for (const [t, m] of best.comp.took) {
         const pool = shuffle(cand.tiers[t].slice(), this.rng);
+        // the answer repeats a title word: have one wrong answer repeat one too
+        // (from the closest tier that has one), so matching words against the
+        // title does not single the answer out
+        if (cand.cue && !picks.some(o => o.cue)) {
+          const i = pool.findIndex(o => o.cue);
+          if (i > 0) pool.unshift(pool.splice(i, 1)[0]);
+        }
         picks.push(...pool.slice(0, m).map(o => Object.assign({ tier: t }, o)));
       }
       const options = shuffle([Object.assign({ correct: true }, cand.correct), ...picks], this.rng);
-      return { card, intro: false, k: best.k, tier: best.s, dMean: best.comp.mean, p: best.p, options };
+      // the tier the distractors actually came from (an empty close tier
+      // falls back to same-area ones, and the label should say so), and
+      // whether even the hardest presentation was predicted above the aim
+      const tier = best.comp.took.length ? best.comp.took[0][0] : best.s;
+      const sat = best.p > aim + 0.03 ? 'hard' : null;
+      return { card, intro: false, k: best.k, tier, sat, dMean: best.comp.mean, p: best.p, options };
     }
 
     next(now, kCap) {
@@ -552,7 +688,7 @@
     snapshot(card) {
       const st = this.prog.cards[card.id];
       return JSON.stringify({ st: st || null, beta: this.prog.beta[card.type], ewma: this.prog.ewma, ctl: this.prog.ctl || 0,
-        q: this.prog.q, recent: this.prog.recent.slice(), hlen: this.prog.hist.length });
+        q: this.prog.q, recent: this.prog.recent.slice(), hist: this.prog.hist.slice() });
     }
 
     restore(card, snap) {
@@ -563,7 +699,7 @@
       this.prog.ctl = s.ctl;
       this.prog.q = s.q;
       this.prog.recent = s.recent;
-      this.prog.hist.length = s.hlen;
+      this.prog.hist = s.hist;   // whole history: at the 400-entry cap a length cannot undo the trim
     }
 
     /* Record an answer. Returns {correct, p}. */
@@ -606,8 +742,14 @@
       st.n++;
       st.last = now;
       st.lastQ = prog.q;
-      prog.ewma = prog.ewma == null ? y : prog.ewma + M.ewmaRate * (y - prog.ewma);
-      prog.ctl = clamp((prog.ctl || 0) + M.ctlRate * (this.set.target - y), M.ctlMin, M.ctlMax);
+      const e0 = prog.ewma == null ? this.set.target : prog.ewma;
+      prog.ewma = e0 + M.ewmaRate * (y - e0);
+      // Anti-windup: when even the hardest presentation was predicted easier
+      // than the aim, a right answer says nothing the controller can act on;
+      // integrating it would leave the aim far too low once the cards change.
+      if (!(question.sat === 'hard' && y)) {
+        prog.ctl = clamp((prog.ctl || 0) + M.ctlRate * (this.set.target - y), M.ctlMin, M.ctlMax);
+      }
       prog.hist.push([now, card.type, k, question.tier, Math.round(p * 1000) / 1000, y]);
       if (prog.hist.length > 400) prog.hist.splice(0, prog.hist.length - 400);
       return { correct: !!y, p };
@@ -632,8 +774,8 @@
 
   return {
     TYPES, TYPE_LABEL, AREAS, AREA_LABEL, MODEL: M,
-    norm, authorString, shortAuthors, surname, personKey, authorsKey, labelKeys, maskSegments, jaccard,
-    mergePapers, buildIndex, thesisText, findTerm, findExample, optionContent, candidates,
+    norm, authorString, shortAuthors, surname, personKey, authorsKey, labelKeys, maskSegments, jaccard, stable,
+    mergePapers, merge3, buildIndex, thesisText, findTerm, findExample, optionContent, candidates,
     composition, freshProgress, defaultSettings, Engine,
   };
 });

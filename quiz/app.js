@@ -39,9 +39,11 @@
     },
   };
 
-  let edits = store.get('edits', null) || { papers: {}, removed: [] };
-  edits.papers = edits.papers || {};
-  edits.removed = edits.removed || [];
+  function normEdits(e) {
+    e = e || {};
+    return { papers: e.papers || {}, base: e.base || {}, removed: e.removed || [] };
+  }
+  let edits = normEdits(store.get('edits', null));
   let progress = store.get('progress', null) || E.freshProgress();
   const defaults = E.defaultSettings();
   const savedSet = store.get('settings', {}) || {};
@@ -149,7 +151,7 @@
     q.options.forEach((o, i) => {
       const content = E.optionContent(index, o);
       const short = o.kind === 'author' || o.kind === 'phen';
-      const btn = h('button', { class: 'opt' + (short ? ' short' : ''), 'data-i': i, onclick: () => choose(i) },
+      const btn = h('button', { class: 'opt' + (short ? ' short' : ''), 'data-i': i, onclick: e => choose(i, e) },
         h('span', { class: 'key' }, String(i + 1)),
         h('span', { class: 'body' },
           h('span', { class: 'txt' }, ...segsToNodes(content.segs)),
@@ -178,33 +180,54 @@
     return true;
   }
 
-  function present(q, keepState, floor) {
+  /* Fit at the normal floor, else at the last-resort one. */
+  function refit() { return fit() || fit(LAST_FS); }
+
+  /* Lay out q invisibly, fit it, show it. A redraw (keepState) keeps the
+   * answered state and skips the fade. False if it overflows even at LAST_FS. */
+  function present(q, keepState) {
     stage.style.visibility = 'hidden';
     renderQuestion(q);
-    const ok = fit(floor);
+    const ok = refit();
     if (keepState && cur && cur.answered) applyReveal();
     stage.style.visibility = '';
     void stage.offsetWidth;
-    if (!keepState) stage.classList.add('enter');
+    if (!keepState) {
+      stage.classList.add('enter');
+      if (cur) cur.shownAt = performance.now();
+    }
     return ok;
+  }
+
+  /* Plan `card` and show it with as many options as fit: start at kCap and
+   * ask the engine for one fewer each time the layout overflows. */
+  function presentCard(card, now, kCap) {
+    for (kCap = kCap || E.MODEL.kMax; ; kCap--) {
+      const q = engine.plan(card, now, kCap);
+      if (!q) return false;                  // engine passes over it for this visit
+      cur = { q, answered: false };
+      if (present(q) || q.k <= 2) return true;
+    }
   }
 
   function nextQuestion() {
     clearTimeout(advanceTimer);
     const now = Date.now();
-    const card = engine.pickCard(now);
-    if (!card) { showEmpty(); return; }
-    let kCap = E.MODEL.kMax, q = null;
-    for (;;) {
-      q = engine.plan(card, now, kCap);
-      if (!q) { nextQuestion(); return; }   // engine passes over it for this visit
-      cur = { q, answered: false };
-      if (present(q)) break;
-      if (q.k <= 2) { present(q, false, LAST_FS); break; }
-      kCap = q.k - 1;
+    for (let tries = 0; tries < 50; tries++) {
+      const card = engine.pickCard(now);
+      if (!card) { showEmpty(); return; }
+      if (presentCard(card, now)) { setFooterAsked(); updateStats(); return; }
     }
+    showEmpty();
+  }
+
+  /* After a resize or a redraw that no longer fits: an unanswered question
+   * is re-planned with fewer options; an answered one keeps its options. */
+  function refitCurrent() {
+    if (!cur) return;
+    if (refit() || cur.answered || cur.q.intro || cur.q.k <= 2) return;
+    presentCard(cur.q.card, Date.now(), cur.q.k - 1);
     setFooterAsked();
-    updateStats();
   }
 
   function showEmpty() {
@@ -272,8 +295,13 @@
     bThesis.classList.toggle('slot-hide', q.card.type !== 't');
   }
 
-  function choose(i) {
-    if (!cur || cur.answered || modalOpen()) return;
+  /* A pointer click within moments of a question appearing is the second
+   * half of a double-click (or double-tap) aimed at the previous one. Keyboard
+   * activation has detail 0 and is never ignored. */
+  function tooSoon(e) { return !!(e && e.detail && cur && cur.shownAt && performance.now() - cur.shownAt < 350); }
+
+  function choose(i, e) {
+    if (!cur || cur.answered || modalOpen() || tooSoon(e)) return;
     const q = cur.q;
     if (i < 0 || i >= q.options.length) return;
     const now = Date.now();
@@ -304,8 +332,8 @@
     updateStats();
   }
 
-  function onNext() {
-    if (!cur) return;
+  function onNext(e) {
+    if (!cur || modalOpen() || tooSoon(e)) return;
     if (cur.q.intro && !cur.answered) { choose(cur.q.options.findIndex(o => o.correct)); return; }
     if (cur.answered) nextQuestion();
   }
@@ -325,11 +353,24 @@
   // ------------------------------------------------------------------ modal shell
   let modalCtx = null;   // {onKey, onClose, canClose}
   function modalOpen() { return !modal.hidden; }
+  /* Focus goes back to the control that opened a dialog only if you reached
+   * it from the keyboard (Tab). After a mouse click or a shortcut it is left
+   * on the page instead, because a button given focus back right after a
+   * keypress counts as :focus-visible and would take the next Enter (meant
+   * for "Next") — reopening the dialog you just closed. */
+  let lastFocus = null;
   function openModal(panel, ctx) {
     clearTimeout(advanceTimer);
+    if (modal.hidden) {
+      const a = document.activeElement;
+      lastFocus = a && a !== document.body && a.matches(':focus-visible') ? a : null;
+    }
     modal.textContent = '';
     modal.append(panel);
     modal.hidden = false;
+    $('app').inert = true;              // nothing behind the dialog can be focused or clicked
+    panel.tabIndex = -1;
+    panel.focus({ preventScroll: true });
     modalCtx = ctx || {};
   }
   /* Close the modal; unless forced, a dialog with unsaved work may ask first. */
@@ -337,8 +378,13 @@
     if (force !== true && modalCtx && modalCtx.canClose && !modalCtx.canClose()) return;
     modal.hidden = true;
     modal.textContent = '';
+    $('app').inert = false;
     const ctx = modalCtx; modalCtx = null;
     if (ctx && ctx.onClose) ctx.onClose();
+    if (!modal.hidden) return;
+    if (lastFocus && document.contains(lastFocus)) lastFocus.focus({ preventScroll: true });
+    else if (document.activeElement && document.activeElement !== document.body) document.activeElement.blur();
+    lastFocus = null;
   }
   modal.addEventListener('mousedown', e => { if (e.target === modal) closeModal(); });
 
@@ -353,12 +399,7 @@
 
   // ------------------------------------------------------------------ editor
   const clone = o => JSON.parse(JSON.stringify(o));
-  function stable(o) {
-    if (Array.isArray(o)) return '[' + o.map(stable).join(',') + ']';
-    if (o && typeof o === 'object') return '{' + Object.keys(o).filter(k => !k.startsWith('_')).sort()
-      .map(k => JSON.stringify(k) + ':' + stable(o[k])).join(',') + '}';
-    return JSON.stringify(o === undefined ? null : o);
-  }
+  const stable = E.stable;
   const uid = () => 'u' + Date.now().toString(36) + Math.floor(Math.random() * 1e4).toString(36);
   const topics = () => [...new Set(index.papers.map(p => p.topic).filter(Boolean))].sort();
 
@@ -400,14 +441,14 @@
     if (isBase && edits.papers[id]) {
       footLeft.append(h('button', { class: 'btn', title: 'Discard your edits to this paper', onclick: () => {
         if (!confirm('Discard your edits and restore the shipped version of this paper?')) return;
-        delete edits.papers[id]; saveEdits(); rebuild(); closeModal(true); refreshAfterEdit();
+        delete edits.papers[id]; delete edits.base[id]; saveEdits(); rebuild(); closeModal(true); refreshAfterEdit();
       } }, 'Restore original'));
     }
     if (existing) {
       footLeft.append(h('button', { class: 'btn danger', onclick: () => {
         if (!confirm(isBase ? 'Hide this paper from the quiz? (Settings can bring hidden papers back.)' : 'Delete this paper?')) return;
-        if (isBase) { if (!edits.removed.includes(id)) edits.removed.push(id); delete edits.papers[id]; }
-        else delete edits.papers[id];
+        if (isBase) { if (!edits.removed.includes(id)) edits.removed.push(id); }
+        else { delete edits.papers[id]; delete edits.base[id]; }
         saveEdits(); rebuild(); closeModal(true); refreshAfterEdit();
       } }, isBase ? 'Hide paper' : 'Delete paper'));
     }
@@ -531,11 +572,27 @@
       const pickedIdx = keep.findIndex(([, i]) => i === paper.pick);
       paper.theses = keep.map(([t]) => Object.assign(t, { text: t.text.trim() }));
       paper.pick = pickedIdx >= 0 ? pickedIdx : 0;
-      paper.terms = paper.terms.filter(t => (t.term || '').trim() && (t.definition || '').trim());
-      paper.examples = paper.examples.filter(x => (x.text || '').trim() && (x.phenomenon || '').trim());
+      // A half-filled term or example is a mistake to point out, not to drop;
+      // only one left entirely empty (an unused "+ Add") goes quietly.
+      const filled = v => !!(v || '').trim();
+      const ti = paper.terms.findIndex(t => filled(t.term) !== filled(t.definition));
+      if (ti >= 0) {
+        alert('Term ' + (ti + 1) + ' needs ' + (filled(paper.terms[ti].term) ? 'its definition.' : 'the term itself.'));
+        ed.tab = 'terms'; ed.ti = ti; draw(); return;
+      }
+      const xi = paper.examples.findIndex(x => filled(x.text) !== filled(x.phenomenon));
+      if (xi >= 0) {
+        alert('Example ' + (xi + 1) + ' needs ' + (filled(paper.examples[xi].text) ? 'the phenomenon it illustrates.' : 'its text.'));
+        ed.tab = 'examples'; ed.xi = xi; draw(); return;
+      }
+      paper.terms = paper.terms.filter(t => filled(t.term));
+      paper.examples = paper.examples.filter(x => filled(x.text));
       for (const [k, v] of Object.entries(off)) { if (v) progress.off[k] = 1; else delete progress.off[k]; }
-      if (isBase && stable(paper) === stable(baseById[id])) delete edits.papers[id];
-      else edits.papers[id] = paper;
+      if (isBase && stable(paper) === stable(baseById[id])) { delete edits.papers[id]; delete edits.base[id]; }
+      else {
+        edits.papers[id] = paper;
+        if (isBase) edits.base[id] = clone(baseById[id]);   // what the edit was made from, for merging later fixes
+      }
       edits.removed = edits.removed.filter(r => r !== id);
       saveEdits(); saveProgress(); rebuild(); closeModal(true); refreshAfterEdit();
     }
@@ -556,15 +613,32 @@
     if (!cur) { nextQuestion(); return; }
     const card = index.cardById[cur.q.card.id];
     const alive = card && engine.active(card) && cur.q.options.every(o => !o.pid || index.byId[o.pid]);
-    if (!alive || (!cur.answered && !cur.q.intro && optionsStale())) { nextQuestion(); return; }
+    if (!alive) { nextQuestion(); return; }
+    if (!cur.answered && !cur.q.intro && optionsStale()) {
+      if (!presentCard(card, Date.now())) { nextQuestion(); return; }
+      setFooterAsked(); updateStats(); return;
+    }
     cur.q.card = card;
     if (cur.q.card.type === 't' || cur.q.card.type === 'a' || cur.q.card.type === 'x') refreshCorrect();
-    present(cur.q, true);
+    if (!present(cur.q, true)) refitCurrent();
     if (!cur.answered) setFooterAsked();
     updateStats();
   }
+  /* An unanswered question is stale when the edit has ruled out one of its
+   * wrong options (now an avoid entry, now the same as the answer, deleted,
+   * or emptied): it is planned again for the same card. */
   function optionsStale() {
-    return cur.q.options.some(o => (o.kind === 'def' && !E.findTerm(index.byId[o.pid] || {}, o.tid)));
+    const fresh = E.candidates(index, cur.q.card);
+    if (!fresh) return true;
+    const key = o => o.kind === 'thesis' ? 't:' + o.pid : o.kind === 'def' ? 'd:' + o.pid + '/' + o.tid
+      : o.kind + ':' + E.norm(o.text);
+    const valid = new Set(fresh.tiers.flat().map(key));
+    const right = E.norm((E.optionContent(index, fresh.correct).segs || []).map(x => x.t).join(''));
+    return cur.q.options.some(o => {
+      if (o.correct) return false;
+      const text = E.norm((E.optionContent(index, o).segs || []).map(x => x.t).join(''));
+      return !valid.has(key(o)) || !text || text === right;
+    });
   }
   // author and phenomenon options carry their text; refresh the right one from the content
   function refreshCorrect() {
@@ -599,9 +673,13 @@
         (p.terms || []).map(t => t.term).join(' '), (p.examples || []).map(x => x.phenomenon).join(' ')].join(' '));
       return E.norm(q).split(' ').every(w => hay.includes(w));
     }
+    let per = 0;
     function drawList() {
       const all = index.papers.filter(p => matches(p, st.query));
-      const per = Math.max(3, Math.floor(listEl.clientHeight / 46));
+      const first = st.page * per;
+      const was = per;
+      per = Math.max(3, Math.floor(listEl.clientHeight / 46));
+      if (was && was !== per) st.page = Math.floor(first / per);
       const pages = Math.max(1, Math.ceil(all.length / per));
       st.page = Math.max(0, Math.min(st.page, pages - 1));
       listEl.textContent = '';
@@ -617,7 +695,7 @@
       prev.disabled = st.page <= 0;
       next.disabled = st.page >= pages - 1;
     }
-    openModal(shell.panel, {});
+    openModal(shell.panel, { onResize: drawList });
     drawList();
     search.focus();
   }
@@ -675,12 +753,16 @@
             h('button', { class: 'btn', onclick: importData }, 'Import'),
             hidden ? h('button', { class: 'btn', onclick: () => { edits.removed = []; saveEdits(); rebuild(); draw(); } }, 'Unhide ' + hidden + ' paper' + (hidden > 1 ? 's' : '')) : null,
             h('button', { class: 'btn danger', onclick: () => {
-              if (!confirm('Forget all progress? Your edits are kept.')) return;
-              progress = E.freshProgress(); store.set('progress', progress); location.reload();
+              if (!confirm('Forget all progress? Your edits, and the cards you switched off, are kept.')) return;
+              const fresh = E.freshProgress();
+              fresh.off = progress.off || {};
+              if (!store.set('progress', fresh)) { alert('This browser is not letting the page save, so nothing was reset.'); return; }
+              location.reload();
             } }, 'Reset progress'),
             h('button', { class: 'btn danger', onclick: () => {
               if (!confirm('Discard every edit and added paper? Progress is kept.')) return;
-              edits = { papers: {}, removed: [] }; store.set('edits', edits); location.reload();
+              if (!store.set('edits', normEdits(null))) { alert('This browser is not letting the page save, so nothing was discarded.'); return; }
+              location.reload();
             } }, 'Discard edits'))));
       body.append(grid);
       const names = ['Difficulty', 'Filters', 'Progress', 'Data'];
@@ -697,7 +779,7 @@
     openModal(shell.panel, { onClose: () => {
       const after = JSON.stringify([settings.types, settings.areas]);
       if (!cur || (after !== before && !(engine.active(cur.q.card)))) nextQuestion();
-      else if (cur) { present(cur.q, true); if (!cur.answered) setFooterAsked(); updateStats(); }
+      else if (cur) { if (!present(cur.q, true)) refitCurrent(); if (!cur.answered) setFooterAsked(); updateStats(); }
     } });
     draw();
   }
@@ -720,15 +802,46 @@
         try { d = JSON.parse(txt); } catch (e) { alert('That file is not valid JSON.'); return; }
         if (!d || d.app !== 'paper-quiz' || !d.progress || !d.edits) { alert('That is not a paper-quiz export.'); return; }
         if (!confirm('Replace this browser\'s progress, edits and settings with the file\'s?')) return;
-        store.set('edits', d.edits); store.set('progress', d.progress); store.set('settings', d.settings || {});
+        const ok = store.set('edits', normEdits(d.edits)) && store.set('progress', d.progress) &&
+          store.set('settings', d.settings || {});
+        if (!ok) {
+          store.set('edits', edits); store.set('progress', progress); store.set('settings', settings);
+          alert('This browser is not letting the page save, so the import was not applied.');
+          return;
+        }
         location.reload();
       });
     });
     input.click();
   }
 
+  // ------------------------------------------------------------------ other tabs
+  // Each tab holds progress and edits in memory and writes them whole, so a
+  // tab left open would overwrite what another tab saved. The storage event
+  // fires in every other tab on each write: take the new state in there.
+  window.addEventListener('storage', e => {
+    if (!e.key || !e.key.startsWith(PREFIX)) return;
+    const k = e.key.slice(PREFIX.length);
+    if (k === 'progress') {
+      progress = store.get('progress', null) || E.freshProgress();
+      engine.prog = progress;
+      for (const t of E.TYPES) if (typeof progress.beta[t] !== 'number') progress.beta[t] = 0;
+      updateStats();
+    } else if (k === 'edits') {
+      edits = normEdits(store.get('edits', null));
+      rebuild();
+      if (!modalOpen()) refreshAfterEdit();
+    } else if (k === 'settings') {
+      const v = store.get('settings', {}) || {};
+      Object.assign(settings, v, { types: Object.assign({}, defaults.types, v.types || {}),
+        areas: Object.assign({}, defaults.areas, v.areas || {}) });
+      applyTheme();
+      updateStats();
+    }
+  });
+
   // ------------------------------------------------------------------ wiring
-  bNext.addEventListener('click', onNext);
+  bNext.addEventListener('click', e => onNext(e));
   bMis.addEventListener('click', misclick);
   bEdit.addEventListener('click', () => {
     if (!cur) return;
@@ -748,11 +861,17 @@
     if (e.metaKey || e.ctrlKey || e.altKey) return;
     const tag = (e.target && e.target.tagName) || '';
     if (/INPUT|TEXTAREA|SELECT/.test(tag)) return;
+    const focused = document.activeElement;
     if (/^[1-9]$/.test(e.key)) { e.preventDefault(); choose(+e.key - 1); }
     else if (e.key === 'Enter' || e.key === ' ' || e.key === 'ArrowRight') {
-      if (document.activeElement && document.activeElement.classList.contains('opt') && !cur?.answered && e.key !== 'ArrowRight') return;
+      // A button reached with Tab (focus-visible) does what it says; a button
+      // that merely kept focus after a mouse click does not steal Enter.
+      if (e.key !== 'ArrowRight' && focused && focused.tagName === 'BUTTON' && focused !== bNext &&
+          !focused.disabled && focused.matches(':focus-visible')) return;
       e.preventDefault(); onNext();
     }
+    else if (e.key === 'm' || e.key === 'M') { e.preventDefault(); misclick(); }
+    else if (e.key === 't' || e.key === 'T') { e.preventDefault(); if (cur && cur.q.card.type === 't') openEditor(cur.q.card.pid, 'thesis'); }
     else if (e.key === 'e' || e.key === 'E') { e.preventDefault(); bEdit.click(); }
     else if (e.key === 'l' || e.key === 'L') { e.preventDefault(); openLibrary(); }
     else if (e.key === 's' || e.key === 'S') { e.preventDefault(); openSettings(); }
@@ -761,7 +880,11 @@
   let resizeTimer = null;
   window.addEventListener('resize', () => {
     clearTimeout(resizeTimer);
-    resizeTimer = setTimeout(() => { if (cur) { if (!fit()) fit(LAST_FS); } updateStats(); }, 80);
+    resizeTimer = setTimeout(() => {
+      refitCurrent();
+      updateStats();
+      if (modalCtx && modalCtx.onResize) modalCtx.onResize();
+    }, 80);
   });
 
   applyTheme();
