@@ -306,7 +306,9 @@
    * (longer for a longer answer). A bar along the footer shows the pause;
    * a tap anywhere, a click on an option or a key moves on sooner. */
   const PAUSE_RIGHT = 1000, PAUSE_WRONG_MIN = 2500, PAUSE_WRONG_MAX = 8000;
-  const timerBar = $('timer');
+  // (made here if the page lacks it: a page cached from before the bar
+  // existed can meet this script, and must not fail on it)
+  const timerBar = $('timer') || $('foot').insertBefore(h('div', { id: 'timer' }), $('foot').firstChild);
   function startPause(ms) {
     stopPause();
     if (!settings.advance) return;
