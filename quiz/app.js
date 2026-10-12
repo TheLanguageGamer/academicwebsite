@@ -502,7 +502,7 @@
     function drawExamples() {
       const list = paper.examples;
       body.append(navBar('Example', list, ed.xi, v => { ed.xi = v; },
-        () => ({ id: uid(), text: '', phenomenon: '', aliases: [], near: [], exact: false })));
+        () => ({ id: uid(), text: '', phenomenon: '', aliases: [], near: [], avoid: [], exact: false })));
       const x = list[ed.xi];
       if (!x) { body.append(h('div', { class: 'hint' }, 'Add an example or scenario from this paper.')); return; }
       body.append(
@@ -511,6 +511,7 @@
           field('Phenomenon it illustrates', text(x.phenomenon, v => { x.phenomenon = v; })),
           field('Words to blank out of the example (comma-separated)', text((x.aliases || []).join(', '), v => { x.aliases = v.split(',').map(s => s.trim()).filter(Boolean); }))),
         field('Near misses — close but wrong answers (separate with ;)', text((x.near || []).join('; '), v => { x.near = v.split(';').map(s => s.trim()).filter(Boolean); })),
+        field('Never offer as a wrong answer — names that are also right (separate with ;)', text((x.avoid || []).join('; '), v => { x.avoid = v.split(';').map(s => s.trim()).filter(Boolean); })),
         h('div', { class: 'row', style: 'gap:16px' },
           h('div', { class: 'narrow' }, check('Exact excerpt', !!x.exact, v => { x.exact = v; })),
           h('div', { class: 'narrow' }, check('Quiz me on this', !isOff('x', x.id), v => setOff('x', x.id, !v)))));

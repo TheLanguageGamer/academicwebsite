@@ -122,6 +122,15 @@
 
   const escRe = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
+  /* Keys for spotting one label twice: its words in any order, and the same
+   * without a parenthetical gloss — "homonymy (lexical ambiguity)" is
+   * "lexical ambiguity (homonymy)", and "cross-sentential anaphora" is
+   * "cross-sentential (discourse) anaphora". */
+  function labelKeys(s) {
+    const words = t => norm(t).split(' ').filter(Boolean).sort().join(' ');
+    return [words(s), words(String(s || '').replace(/\([^)]*\)/g, ' '))].filter(Boolean);
+  }
+
   /* Split `text` into [{t: string, blank: bool}] with every needle (and its
    * plural) blanked, whole-word and case-insensitive. */
   function maskSegments(text, needles) {
@@ -297,10 +306,15 @@
       const t = findTerm(p, card.ref);
       if (!t) return null;
       const tn = norm(t.term);
+      // `avoid` ("paper/term" refs) names definitions of the same notion that
+      // could pass for this paper's; either side's list rules the pair out
+      const me = p.id + '/' + t.id;
+      const avoid = new Set(t.avoid || []);
       for (const q of index.papers) {
         for (const u of q.terms || []) {
           if (!u || !u.definition || !u.term) continue;
           if (q.id === p.id && u.id === t.id) continue;
+          if (avoid.has(q.id + '/' + u.id) || (u.avoid || []).includes(me)) continue;
           if (jaccard(u.definition, t.definition) > 0.6) continue;
           const o = { kind: 'def', pid: q.id, tid: u.id };
           if (q.id === p.id || norm(u.term) === tn || q.topic === topic) tiers[2].push(o);
@@ -316,23 +330,27 @@
       if (!x) return null;
       const right = norm(x.phenomenon);
       // `avoid` lists names that would also be a right answer for this example
-      const avoid = new Set((x.avoid || []).map(norm));
-      const clash = k => !k || k === right || k.includes(right) || right.includes(k) || avoid.has(k);
-      // Never offer another name for the same thing: anything this paper's
-      // own examples are labelled with, or the same topic's labels unless the
-      // example's own near-miss list vouches for them.
-      const sameTopic = new Set();
-      for (const [k, e] of index.phenPool) if (e.topics.has(topic)) sameTopic.add(k);
-      const used = new Set();
+      const avoid = new Set((x.avoid || []).flatMap(labelKeys));
+      const seen = new Set(labelKeys(x.phenomenon));
+      const repeat = n => labelKeys(n).some(k => seen.has(k) || avoid.has(k));
+      const take = n => labelKeys(n).forEach(k => seen.add(k));
+      // The example's own near misses were checked against it: offer each
+      // unless it is the answer again or on the avoid list — even "non-natural
+      // meaning" against "natural meaning", which is the point of the pair.
       for (const n of x.near || []) {
-        const k = norm(n);
-        if (clash(k) || used.has(k)) continue;
-        used.add(k);
+        if (!norm(n) || repeat(n)) continue;
+        take(n);
         tiers[2].push({ kind: 'phen', text: n });
       }
+      // Names from other papers were not: never one from the same topic (it
+      // may be another name for the same thing), nor one that contains the
+      // answer or is contained in it ("implicature" for "scalar implicature").
+      const sameTopic = new Set();
+      for (const [k, e] of index.phenPool) if (e.topics.has(topic)) sameTopic.add(k);
+      const nests = k => (' ' + k + ' ').includes(' ' + right + ' ') || (' ' + right + ' ').includes(' ' + k + ' ');
       for (const [k, e] of index.phenPool) {
-        if (clash(k) || used.has(k) || sameTopic.has(k)) continue;
-        used.add(k);
+        if (!k || sameTopic.has(k) || nests(k) || repeat(e.text)) continue;
+        take(e.text);
         if (e.areas.has(area)) tiers[1].push({ kind: 'phen', text: e.text });
         else tiers[0].push({ kind: 'phen', text: e.text });
       }
@@ -614,7 +632,7 @@
 
   return {
     TYPES, TYPE_LABEL, AREAS, AREA_LABEL, MODEL: M,
-    norm, authorString, shortAuthors, surname, personKey, authorsKey, maskSegments, jaccard,
+    norm, authorString, shortAuthors, surname, personKey, authorsKey, labelKeys, maskSegments, jaccard,
     mergePapers, buildIndex, thesisText, findTerm, findExample, optionContent, candidates,
     composition, freshProgress, defaultSettings, Engine,
   };
