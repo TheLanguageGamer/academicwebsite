@@ -20,7 +20,7 @@
   const E = window.QuizEngine;
   const DATA = window.QUIZ_DATA || { version: 'none', papers: [] };
   const PREFIX = 'phq1.';
-  const TIER = ['varied distractors', 'same-area distractors', 'close distractors'];
+  const TIER = ['varied distractors', 'same-area distractors', 'same-topic distractors', 'closest distractors'];
   const MIN_FS = 11.5;
   const LAST_FS = 10;     // only when two options will not fit at MIN_FS
 
@@ -801,7 +801,8 @@
               onchange: e => { settings.maxOptions = +e.target.value; changed(); } })),
           h('div', { class: 'chips', style: 'margin-top:8px' },
             h('label', { class: 'check' }, h('input', { type: 'checkbox', checked: settings.showYear, onchange: e => { settings.showYear = e.target.checked; changed(); } }), 'Show year with title'),
-            h('label', { class: 'check' }, h('input', { type: 'checkbox', checked: settings.advance, onchange: e => { settings.advance = e.target.checked; changed(); } }), 'Move on by itself after answering')),
+            h('label', { class: 'check' }, h('input', { type: 'checkbox', checked: settings.advance, onchange: e => { settings.advance = e.target.checked; changed(); } }), 'Move on by itself after answering'),
+            h('label', { class: 'check' }, h('input', { type: 'checkbox', checked: settings.lessonFirst, onchange: e => { settings.lessonFirst = e.target.checked; changed(); } }), 'Show a new card’s answer first')),
           h('label', { class: 'f', style: 'margin-top:8px' }, 'Theme',
             h('select', { onchange: e => { settings.theme = e.target.value; changed(); } },
               ['auto', 'light', 'dark'].map(t => h('option', { value: t, selected: settings.theme === t ? 'selected' : null }, t))))),
