@@ -728,7 +728,7 @@
       // over the card for the rest of this visit rather than ask a 1-option review
       if (kMax < 2) { this.skip.add(card.id); return null; }
       const aim = this.aim();
-      let best = null;
+      let best = null, hardest = null;
       for (let k = 2; k <= kMax; k++) {
         for (let s = 0; s <= 2; s++) {
           const comp = composition(counts, k - 1, s);
@@ -737,9 +737,15 @@
           // nearest the aim; among near-ties, closer distractors, then fewer options
           const score = Math.abs(p - aim) - 0.004 * s + 0.002 * k;
           if (!best || score < best.score) best = { k, s, p, comp, score };
+          if (!hardest || p < hardest.p) hardest = { k, s, p, comp };
         }
       }
       if (!best) { this.skip.add(card.id); return null; }
+      // Even the hardest presentation too easy: ask that one. (Near certainty
+      // every presentation's chance is squeezed toward 1 — 0.999 with two
+      // options, 0.996 with six close ones — and the tie-breaks above would
+      // otherwise pick the fewest options.)
+      if (hardest.p > aim + 0.03) best = hardest;
       const picks = [];
       for (const [t, m] of best.comp.took) {
         const pool = shuffle(cand.tiers[t].slice(), this.rng);
