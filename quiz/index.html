@@ -75,7 +75,7 @@
          align-items: start; text-align: left; background: var(--panel); border: 1.5px solid var(--line);
          border-radius: 8px; padding: .5em .7em; box-shadow: var(--shadow); line-height: 1.32;
          transition: background-color .12s, border-color .12s, opacity .12s; }
-  .opt:not(:disabled):hover { border-color: var(--faint); }
+  .opt:not(:disabled):not(.done):hover { border-color: var(--faint); }
   .opt:disabled { cursor: default; }
   .opt .key { font-family: var(--sans); font-size: .72em; color: var(--muted); border: 1px solid var(--line);
               border-radius: 4px; text-align: center; line-height: 1.5; margin-top: .12em; }
@@ -92,7 +92,11 @@
 
   /* footer */
   #foot { border-top: 1px solid var(--line); display: grid; grid-template-columns: minmax(0, 1fr) auto;
-          align-items: center; gap: 4px 12px; font-size: 14px; }
+          align-items: center; gap: 4px 12px; font-size: 14px; position: relative; }
+  /* the pause before the next question: a bar along the footer's top edge
+     that runs down to zero (absolutely placed, so nothing else moves) */
+  #timer { position: absolute; left: 0; top: -2px; height: 3px; width: 0; background: var(--accent);
+           opacity: .55; pointer-events: none; }
   #fb { min-width: 0; }
   #verdict, #meta { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; line-height: 1.35; }
   #verdict { font-weight: 600; min-height: 1.35em; }
@@ -189,12 +193,13 @@
   </header>
   <main id="stage" aria-live="polite"></main>
   <footer id="foot">
+    <div id="timer"></div>
     <div id="fb"><div id="verdict"></div><div id="meta"></div></div>
     <div class="acts">
       <button id="b-thesis" class="slot-hide" title="Choose which statement this paper is quizzed on (T)">Thesis…</button>
       <button id="b-mis" class="slot-hide" title="Count this answer as correct (M)">Misclick</button>
       <button id="b-edit" title="Edit this card (E)">Edit</button>
-      <button id="next" disabled title="Next question (Enter)">Next →</button>
+      <button id="next" disabled title="Next question (Enter, or tap anywhere once answered)">Next →</button>
     </div>
   </footer>
 </div>

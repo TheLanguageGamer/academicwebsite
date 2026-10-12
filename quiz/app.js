@@ -117,7 +117,7 @@
     }
     const x = E.findExample(p, c.ref);
     const segs = E.maskSegments(x.text, [x.phenomenon].concat(x.aliases || []));
-    return [h('div', { class: 'q-sub' }, 'Which phenomenon does this example illustrate?'),
+    return [h('div', { class: 'q-sub' }, 'In ', ...titleBits(p), ', which phenomenon does this example illustrate?'),
             h('div', { class: 'q example' }, ...segsToNodes(segs))];
   }
 
@@ -211,14 +211,15 @@
   }
 
   function nextQuestion() {
-    clearTimeout(advanceTimer);
+    stopPause();
     const now = Date.now();
-    for (let tries = 0; tries < 50; tries++) {
-      const card = engine.pickCard(now);
-      if (!card) { showEmpty(); return; }
-      if (presentCard(card, now)) { setFooterAsked(); updateStats(); return; }
-    }
-    showEmpty();
+    const q = engine.next(now);
+    if (!q) { showEmpty(); return; }
+    cur = { q, answered: false };
+    // too tall for the screen: the same card again, with fewer options
+    if (!present(q) && !q.intro && q.k > 2) presentCard(q.card, now, q.k - 1);
+    setFooterAsked();
+    updateStats();
   }
 
   /* After a resize or a redraw that no longer fits: an unanswered question
@@ -273,15 +274,15 @@
       return (t.exact ? 'Exact excerpt' : 'Paraphrase') + ' · ' + E.shortAuthors(p.authors) + ' ' + (p.year || '');
     }
     const x = E.findExample(p, c.ref) || {};
-    return 'From ' + E.shortAuthors(p.authors) + ', ‘' + p.title + '’' + (p.year ? ' (' + p.year + ')' : '') +
-      ' · ' + (x.exact ? 'exact excerpt' : 'paraphrase');
+    return 'From ' + E.shortAuthors(p.authors) + (p.year ? ' ' + p.year : '') + ' · ' + (x.exact ? 'exact excerpt' : 'paraphrase');
   }
 
   function applyReveal() {
     const q = cur.q;
     stage.classList.add('revealed');
     stage.querySelectorAll('.opt').forEach((b, i) => {
-      b.disabled = true;
+      b.classList.add('done');
+      b.setAttribute('aria-disabled', 'true');
       b.classList.toggle('correct', !!q.options[i].correct);
       b.classList.toggle('wrong', i === cur.chosen && !q.options[i].correct);
     });
@@ -300,8 +301,38 @@
    * activation has detail 0 and is never ignored. */
   function tooSoon(e) { return !!(e && e.detail && cur && cur.shownAt && performance.now() - cur.shownAt < 350); }
 
+  /* After an answer the quiz moves on by itself: soon after a right one,
+   * and after a wrong one once there has been time to read the right answer
+   * (longer for a longer answer). A bar along the footer shows the pause;
+   * a tap anywhere, a click on an option or a key moves on sooner. */
+  const PAUSE_RIGHT = 1000, PAUSE_WRONG_MIN = 2500, PAUSE_WRONG_MAX = 8000;
+  const timerBar = $('timer');
+  function startPause(ms) {
+    stopPause();
+    if (!settings.advance) return;
+    advanceTimer = setTimeout(nextQuestion, ms);
+    timerBar.style.transition = 'none';
+    timerBar.style.width = '100%';
+    void timerBar.offsetWidth;
+    timerBar.style.transition = 'width ' + ms + 'ms linear';
+    timerBar.style.width = '0';
+  }
+  function stopPause() {
+    clearTimeout(advanceTimer);
+    advanceTimer = null;
+    timerBar.style.transition = 'none';
+    timerBar.style.width = '0';
+  }
+  function pauseAfter(correct) {
+    if (correct) return PAUSE_RIGHT;
+    const right = stage.querySelector('.opt.correct');
+    const words = right ? right.textContent.trim().split(/\s+/).length : 5;
+    return Math.max(PAUSE_WRONG_MIN, Math.min(PAUSE_WRONG_MAX, 1500 + 220 * words));
+  }
+
   function choose(i, e) {
-    if (!cur || cur.answered || modalOpen() || tooSoon(e)) return;
+    if (!cur || modalOpen() || tooSoon(e)) return;
+    if (cur.answered) { onNext(e); return; }     // a click on an option, or a key, after answering
     const q = cur.q;
     if (i < 0 || i >= q.options.length) return;
     const now = Date.now();
@@ -316,10 +347,11 @@
     cur.answered = true;
     cur.chosen = i;
     cur.at = now;
+    cur.answeredAt = performance.now();
     saveProgress();
     applyReveal();
     updateStats();
-    if (cur.res.correct && settings.autoAdvance) advanceTimer = setTimeout(nextQuestion, 1300);
+    startPause(pauseAfter(cur.res.correct));
   }
 
   function misclick() {
@@ -330,12 +362,15 @@
     saveProgress();
     applyReveal();
     updateStats();
+    if (advanceTimer) startPause(PAUSE_RIGHT);
   }
 
   function onNext(e) {
     if (!cur || modalOpen() || tooSoon(e)) return;
     if (cur.q.intro && !cur.answered) { choose(cur.q.options.findIndex(o => o.correct)); return; }
-    if (cur.answered) nextQuestion();
+    // not in the first moments after answering: a double-click on an option
+    // would otherwise skip the feedback it was meant to show
+    if (cur.answered && performance.now() - (cur.answeredAt || 0) > 350) nextQuestion();
   }
 
   function updateStats() {
@@ -360,7 +395,7 @@
    * for "Next") — reopening the dialog you just closed. */
   let lastFocus = null;
   function openModal(panel, ctx) {
-    clearTimeout(advanceTimer);
+    stopPause();
     if (modal.hidden) {
       const a = document.activeElement;
       lastFocus = a && a !== document.body && a.matches(':focus-visible') ? a : null;
@@ -730,7 +765,7 @@
               onchange: e => { settings.maxOptions = +e.target.value; changed(); } })),
           h('div', { class: 'chips', style: 'margin-top:8px' },
             h('label', { class: 'check' }, h('input', { type: 'checkbox', checked: settings.showYear, onchange: e => { settings.showYear = e.target.checked; changed(); } }), 'Show year with title'),
-            h('label', { class: 'check' }, h('input', { type: 'checkbox', checked: settings.autoAdvance, onchange: e => { settings.autoAdvance = e.target.checked; changed(); } }), 'Auto-advance when right')),
+            h('label', { class: 'check' }, h('input', { type: 'checkbox', checked: settings.advance, onchange: e => { settings.advance = e.target.checked; changed(); } }), 'Move on by itself after answering')),
           h('label', { class: 'f', style: 'margin-top:8px' }, 'Theme',
             h('select', { onchange: e => { settings.theme = e.target.value; changed(); } },
               ['auto', 'light', 'dark'].map(t => h('option', { value: t, selected: settings.theme === t ? 'selected' : null }, t))))),
@@ -824,8 +859,7 @@
     const k = e.key.slice(PREFIX.length);
     if (k === 'progress') {
       progress = store.get('progress', null) || E.freshProgress();
-      engine.prog = progress;
-      for (const t of E.TYPES) if (typeof progress.beta[t] !== 'number') progress.beta[t] = 0;
+      engine.setProgress(progress);
       updateStats();
     } else if (k === 'edits') {
       edits = normEdits(store.get('edits', null));
@@ -842,6 +876,12 @@
 
   // ------------------------------------------------------------------ wiring
   bNext.addEventListener('click', e => onNext(e));
+  // once answered, a tap anywhere but a control moves on
+  for (const el of [stage, $('fb')]) {
+    el.addEventListener('click', e => {
+      if (cur && cur.answered && !e.target.closest('button, a, input, textarea, select')) onNext(e);
+    });
+  }
   bMis.addEventListener('click', misclick);
   bEdit.addEventListener('click', () => {
     if (!cur) return;
@@ -875,6 +915,7 @@
     else if (e.key === 'e' || e.key === 'E') { e.preventDefault(); bEdit.click(); }
     else if (e.key === 'l' || e.key === 'L') { e.preventDefault(); openLibrary(); }
     else if (e.key === 's' || e.key === 'S') { e.preventDefault(); openSettings(); }
+    else if (cur && cur.answered && e.key.length === 1) { e.preventDefault(); onNext(); }   // any other key moves on
   });
 
   let resizeTimer = null;
