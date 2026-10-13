@@ -20,7 +20,7 @@
   const E = window.QuizEngine;
   const DATA = window.QUIZ_DATA || { version: 'none', papers: [] };
   const PREFIX = 'phq1.';
-  const TIER = ['varied distractors', 'same-area distractors', 'close distractors'];
+  const TIER = ['varied distractors', 'same-area distractors', 'same-topic distractors', 'closest distractors'];
   const MIN_FS = 11.5;
   const LAST_FS = 10;     // only when two options will not fit at MIN_FS
 
@@ -87,8 +87,12 @@
     return el;
   }
 
-  function segsToNodes(segs) {
-    return segs.map(s => s.blank ? h('span', { class: 'blank', title: 'blanked term' }) : document.createTextNode(s.t));
+  /* With `fill`, each blank also carries its words, hidden until the option
+   * is marked show-fill (the right answer, once answered). */
+  function segsToNodes(segs, fill) {
+    return segs.flatMap(s => !s.blank ? [document.createTextNode(s.t)]
+      : fill ? [h('span', { class: 'blank', title: 'blanked term' }), h('span', { class: 'fill' }, s.t)]
+      : [h('span', { class: 'blank', title: 'blanked term' })]);
   }
 
   function showSaveWarn() { $('savewarn').hidden = store.ok; }
@@ -154,14 +158,36 @@
       const btn = h('button', { class: 'opt' + (short ? ' short' : ''), 'data-i': i, onclick: e => choose(i, e) },
         h('span', { class: 'key' }, String(i + 1)),
         h('span', { class: 'body' },
-          h('span', { class: 'txt' }, ...segsToNodes(content.segs)),
+          h('span', { class: 'txt' }, ...segsToNodes(content.segs, o.kind === 'def')),
           withCap ? h('span', { class: 'cap' }, caption(q, o)) : null));
+      // a new card shows its answer whole: the blanks are there to be guessed
+      if (q.intro && o.kind === 'def') btn.classList.add('show-fill');
       ol.append(h('li', {}, btn));
     });
     stage.append(ol);
   }
 
-  function fits() { return stage.scrollHeight <= stage.clientHeight + 1 && stage.scrollWidth <= stage.clientWidth + 1; }
+  /* The right option, if it is a definition with blanks to fill once
+   * answered (null otherwise). */
+  function fillTarget() {
+    if (!cur || cur.q.card.type !== 'd') return null;
+    const b = stage.querySelectorAll('.opt')[cur.q.options.findIndex(o => o.correct)];
+    return b && b.querySelector('.fill') ? b : null;
+  }
+
+  /* The question must fit as asked and, for a definition, also with the
+   * right answer's blanks filled in, as it will be once answered (the font
+   * is chosen for both, so filling in never overflows). */
+  function fits() {
+    const ok = () => stage.scrollHeight <= stage.clientHeight + 1 && stage.scrollWidth <= stage.clientWidth + 1;
+    const right = fillTarget();
+    if (!right || right.classList.contains('show-fill')) return ok();
+    if (!ok()) return false;
+    right.classList.add('show-fill');
+    const filled = ok();
+    right.classList.remove('show-fill');
+    return filled;
+  }
   function maxFs() { return window.innerWidth < 560 ? 18 : 21; }
 
   /* Largest font size (floor..max) at which the stage does not overflow. */
@@ -280,6 +306,8 @@
   function applyReveal() {
     const q = cur.q;
     stage.classList.add('revealed');
+    const fill = fillTarget();
+    if (fill) fill.classList.add('show-fill');
     stage.querySelectorAll('.opt').forEach((b, i) => {
       b.classList.add('done');
       b.setAttribute('aria-disabled', 'true');
@@ -353,7 +381,9 @@
     saveProgress();
     applyReveal();
     updateStats();
-    startPause(pauseAfter(cur.res.correct));
+    // a right answer with blanks filled in is there to be read: wait for Next
+    cur.waitNext = !!fillTarget();
+    if (!cur.waitNext) startPause(pauseAfter(cur.res.correct));
   }
 
   function misclick() {
@@ -367,9 +397,13 @@
     if (advanceTimer) startPause(PAUSE_RIGHT);
   }
 
-  function onNext(e) {
+  /* `explicit`: Next itself (the button, Enter, Space, →), as opposed to a
+   * tap elsewhere, a click on an option or another key — which do not move
+   * on from an answer the quiz is waiting on you to read. */
+  function onNext(e, explicit) {
     if (!cur || modalOpen() || tooSoon(e)) return;
     if (cur.q.intro && !cur.answered) { choose(cur.q.options.findIndex(o => o.correct)); return; }
+    if (cur.waitNext && !explicit) return;
     // not in the first moments after answering: a double-click on an option
     // would otherwise skip the feedback it was meant to show
     if (cur.answered && performance.now() - (cur.answeredAt || 0) > 350) nextQuestion();
@@ -767,7 +801,8 @@
               onchange: e => { settings.maxOptions = +e.target.value; changed(); } })),
           h('div', { class: 'chips', style: 'margin-top:8px' },
             h('label', { class: 'check' }, h('input', { type: 'checkbox', checked: settings.showYear, onchange: e => { settings.showYear = e.target.checked; changed(); } }), 'Show year with title'),
-            h('label', { class: 'check' }, h('input', { type: 'checkbox', checked: settings.advance, onchange: e => { settings.advance = e.target.checked; changed(); } }), 'Move on by itself after answering')),
+            h('label', { class: 'check' }, h('input', { type: 'checkbox', checked: settings.advance, onchange: e => { settings.advance = e.target.checked; changed(); } }), 'Move on by itself after answering'),
+            h('label', { class: 'check' }, h('input', { type: 'checkbox', checked: settings.lessonFirst, onchange: e => { settings.lessonFirst = e.target.checked; changed(); } }), 'Show a new card’s answer first')),
           h('label', { class: 'f', style: 'margin-top:8px' }, 'Theme',
             h('select', { onchange: e => { settings.theme = e.target.value; changed(); } },
               ['auto', 'light', 'dark'].map(t => h('option', { value: t, selected: settings.theme === t ? 'selected' : null }, t))))),
@@ -877,7 +912,7 @@
   });
 
   // ------------------------------------------------------------------ wiring
-  bNext.addEventListener('click', e => onNext(e));
+  bNext.addEventListener('click', e => onNext(e, true));
   // once answered, a tap anywhere but a control moves on
   for (const el of [stage, $('fb')]) {
     el.addEventListener('click', e => {
@@ -910,7 +945,7 @@
       // that merely kept focus after a mouse click does not steal Enter.
       if (e.key !== 'ArrowRight' && focused && focused.tagName === 'BUTTON' && focused !== bNext &&
           !focused.disabled && focused.matches(':focus-visible')) return;
-      e.preventDefault(); onNext();
+      e.preventDefault(); onNext(null, true);
     }
     else if (e.key === 'm' || e.key === 'M') { e.preventDefault(); misclick(); }
     else if (e.key === 't' || e.key === 'T') { e.preventDefault(); if (cur && cur.q.card.type === 't') openEditor(cur.q.card.pid, 'thesis'); }
