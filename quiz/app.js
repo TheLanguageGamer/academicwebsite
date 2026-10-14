@@ -236,7 +236,26 @@
     }
   }
 
+  /* A phone keeps a tab's page alive for days, so a page left open would go
+   * on running an old version however often the site changes. When the tab
+   * comes back into view (and every ten minutes) the page asks the site for
+   * its current index.html; if that loads different scripts, it reloads
+   * itself at the next question — progress is saved after every answer. */
+  const running = ((document.querySelector('script[src*="app.js"]') || {}).src || '').match(/app\.js\?v=([0-9a-f]+)/);
+  let updateReady = false, lastCheck = -Infinity;
+  function checkForUpdate() {
+    if (!running || updateReady || performance.now() - lastCheck < 60e3) return;
+    lastCheck = performance.now();
+    fetch('index.html', { cache: 'no-store' }).then(r => (r.ok ? r.text() : '')).then(html => {
+      const m = html.match(/src="app\.js\?v=([0-9a-f]+)"/);
+      if (m && m[1] !== running[1]) updateReady = true;
+    }).catch(() => {});
+  }
+  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') checkForUpdate(); });
+  setInterval(checkForUpdate, 10 * 60e3);
+
   function nextQuestion() {
+    if (updateReady && !modalOpen()) { location.reload(); return; }
     stopPause();
     const now = Date.now();
     const q = engine.next(now);
