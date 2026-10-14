@@ -816,21 +816,23 @@
      * once some forgetting makes it a test again. New cards are weighed
      * together: of the next one of each type, the one pitched nearest the
      * aim is asked, so the kinds of question that are hard for you come in
-     * first. If nothing else can be asked, the first one passed over is. */
+     * first. If everything is too easy, the hardest new card is asked (else
+     * the first review passed over). */
     next(now, kCap) {
       const aim = this.aim();
       const pool = this.pools(now);
-      let fallback = null, passed = 0;
       const tooEasy = q => !q.intro && q.p > aim + M.passMargin;
+      let fallback = null, passed = 0;
+      // a review, or the card nearest to due: asked unless too easy (then
+      // kept as the fallback); at most passMax are planned
       const ask = card => {
+        if (passed >= M.passMax) return null;
         const q = this.plan(card, now, kCap);
         if (!q) return null;
-        if (tooEasy(q) && passed < M.passMax) {
-          if (!fallback) fallback = q;
-          passed++;
-          return null;
-        }
-        return q;
+        if (!tooEasy(q)) return q;
+        if (!fallback) fallback = q;
+        passed++;
+        return null;
       };
       // a persistent shortfall with nothing due: review what is nearly due
       // before adding more
@@ -838,16 +840,13 @@
       const first = short && pool.fresh.length ? pool.ready.slice(0, 1) : pool.due.slice(0, 1);
       for (const card of first) { const q = ask(card); if (q) return q; }
       const plans = pool.fresh.map(c => this.plan(c, now, kCap)).filter(Boolean);
-      if (plans.length) {
-        const fit = plans.filter(q => !tooEasy(q))
-          .sort((a, b) => Math.abs(a.p - aim) - Math.abs(b.p - aim));
-        if (fit.length) return fit[0];
-        const hardest = plans.slice().sort((a, b) => a.p - b.p)[0];
-        if (!fallback) fallback = hardest;
-        passed++;
-      }
+      const fit = plans.filter(q => !tooEasy(q)).sort((a, b) => Math.abs(a.p - aim) - Math.abs(b.p - aim));
+      if (fit.length) return fit[0];
       const rest = pool.due.slice(1).concat(pool.early.filter(c => !first.includes(c)));
       for (const card of rest.slice(0, 60)) { const q = ask(card); if (q) return q; }
+      // everything too easy: a new card rather than one more easy review, or
+      // a run of right answers would keep you on the cards already seen
+      if (plans.length) return plans.sort((a, b) => a.p - b.p)[0];
       if (!fallback && pool.oldest) fallback = this.plan(pool.oldest, now, kCap);
       return fallback;
     }
